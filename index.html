@@ -1,43 +1,4 @@
-<script type="text/javascript">
-        var gk_isXlsx = false;
-        var gk_xlsxFileLookup = {};
-        var gk_fileData = {};
-        function filledCell(cell) {
-          return cell !== '' && cell != null;
-        }
-        function loadFileData(filename) {
-        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
-            try {
-                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
-                var firstSheetName = workbook.SheetNames[0];
-                var worksheet = workbook.Sheets[firstSheetName];
-
-                // Convert sheet to JSON to filter blank rows
-                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
-                // Filter out blank rows (rows where all cells are empty, null, or undefined)
-                var filteredData = jsonData.filter(row => row.some(filledCell));
-
-                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
-                var headerRowIndex = filteredData.findIndex((row, index) =>
-                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
-                );
-                // Fallback
-                if (headerRowIndex === -1 || headerRowIndex > 25) {
-                  headerRowIndex = 0;
-                }
-
-                // Convert filtered JSON back to CSV
-                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
-                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
-                return csv;
-            } catch (e) {
-                console.error(e);
-                return "";
-            }
-        }
-        return gk_fileData[filename] || "";
-        }
-        </script><!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -68,13 +29,12 @@
 
       const configuration = {
         iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'turn:your-turn-server:3478', username: 'user', credential: 'password' }
+          { urls: 'stun:stun.l.google.com:19302' }
         ]
       };
 
       useEffect(() => {
-        socket.current = io('https://localhost:8080', { secure: true });
+        socket.current = io('https://your-vercel-app.vercel.app/api/signaling'); // Replace with your Vercel URL
         socket.current.on('connect', () => setStatus('Connected to signaling server'));
         socket.current.on('sessionCreated', ({ sessionId }) => {
           setSessionId(sessionId);
@@ -101,7 +61,7 @@
           await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
         });
         socket.current.on('data', ({ data }) => {
-          window.electronAPI.simulateInput(data);
+          if (window.electronAPI) window.electronAPI.simulateInput(data);
           setStatus(`Input: ${data.type} - ${data.x || data.key}`);
         });
         return () => socket.current.disconnect();
@@ -145,7 +105,7 @@
           localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
           peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
-              socket.current.emit('candidate', { candidate, sessionId });
+              socket.current.emit('candidate', { candidate: event.candidate, sessionId });
             }
           };
           const offer = await peerConnection.createOffer();
@@ -257,5 +217,3 @@
 
     ReactDOM.render(<App />, document.getElementById('root'));
   </script>
-</body>
-</html>
