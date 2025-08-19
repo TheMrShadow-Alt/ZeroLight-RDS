@@ -1,0 +1,261 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Remote Desktop</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const App = () => {
+      const localVideoRef = useRef(null);
+      const remoteVideoRef = useRef(null);
+      const [sessionId, setSessionId] = useState('');
+      const [password, setPassword] = useState('');
+      const [status, setStatus] = useState('Waiting...');
+      const [isSharing, setIsSharing] = useState(false);
+      const socket = useRef(null);
+      let localStream = null;
+      let peerConnection = null;
+      let dataChannel = null;
+
+      const configuration = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'turn:your-turn-server:3478', username: 'user', credential: 'password' }
+        ]
+      };
+
+      useEffect(() => {
+        socket.current = io('https://localhost:8080', { secure: true });
+        socket.current.on('connect', () => setStatus('Connected to signaling server'));
+        socket.current.on('sessionCreated', ({ sessionId }) => {
+          setSessionId(sessionId);
+          setStatus(`Session created with ID ${sessionId}`);
+        });
+        socket.current.on('sessionError', ({ message }) => setStatus(`Error: ${message}`));
+        socket.current.on('offer', async ({ offer, from }) => {
+          peerConnection = new RTCPeerConnection(configuration);
+          dataChannel = peerConnection.createDataChannel('input');
+          setupDataChannel();
+          peerConnection.ontrack = (event) => {
+            remoteVideoRef.current.srcObject = event.streams[0];
+            setStatus('Receiving remote stream');
+          };
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.current.emit('answer', { answer, to: from, sessionId });
+        });
+        socket.current.on('answer', async ({ answer }) => {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+        });
+        socket.current.on('candidate', async ({ candidate }) => {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        });
+        socket.current.on('data', ({ data }) => {
+          window.electronAPI.simulateInput(data);
+          setStatus(`Input: ${data.type} - ${data.x || data.key}`);
+        });
+        return () => socket.current.disconnect();
+      }, []);
+
+      const setupDataChannel = () => {
+        dataChannel.onopen = () => setStatus('Data channel open');
+        dataChannel.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          socket.current.emit('data', { data, sessionId });
+        };
+      };
+
+      const createSession = () => {
+        if (!password) {
+          setStatus('Error: Password required');
+          return;
+        }
+        socket.current.emit('createSession', { password });
+      };
+
+      const joinSession = () => {
+        if (!sessionId || !password) {
+          setStatus('Error: Session ID and password required');
+          return;
+        }
+        socket.current.emit('joinSession', { sessionId, password });
+      };
+
+      const startSharing = async () => {
+        try {
+          localStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: 30, width: { max: 1280 }, height: { max: 720 } }
+          });
+          localVideoRef.current.srcObject = localStream;
+          peerConnection = new RTCPeerConnection(configuration);
+          peerConnection.ondatachannel = (event) => {
+            dataChannel = event.channel;
+            setupDataChannel();
+          };
+          localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              socket.current.emit('candidate', { candidate, sessionId });
+            }
+          };
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          socket.current.emit('offer', { offer, sessionId });
+          setStatus('Sharing screen');
+          setIsSharing(true);
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+        }
+      };
+
+      const stopSharing = () => {
+        if (localStream) {
+          localStream.getTracks().forEach(track => track.stop());
+          localVideoRef.current.srcObject = null;
+          if (peerConnection) peerConnection.close();
+          setStatus('Stopped sharing');
+          setIsSharing(false);
+        }
+      };
+
+      const handleRemoteClick = (event) => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+          const rect = remoteVideoRef.current.getBoundingClientRect();
+          const x = (event.clientX - rect.left) / rect.width;
+          const y = (event.clientY - rect.top) / rect.height;
+          dataChannel.send(JSON.stringify({ type: 'mouse', x, y }));
+        }
+      };
+
+      const handleKeyDown = (event) => {
+        if (dataChannel && dataChannel.readyState === 'open') {
+          dataChannel.send(JSON.stringify({ type: 'keyboard', key: event.key }));
+        }
+      };
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-3xl font-bold mb-4 text-center">Remote Desktop</h1>
+          <div className="flex flex-col items-center mb-6">
+            <input
+              type="text"
+              placeholder="Session ID"
+              value={sessionId}
+              onChange={(e) => setSessionId(e.target.value)}
+              className="border p-2 mb-2 w-64 rounded"
+            />
+            <input
+              type="password"
+              placeholder="Session Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="border p-2 mb-2 w-64 rounded"
+            />
+            <div className="flex space-x-2">
+              <button
+                onClick={createSession}
+                className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+              >
+                Create Session
+              </button>
+              <button
+                onClick={joinSession}
+                className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+              >
+                Join Session
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-col md:flex-row justify-center space-y-4 md:space-y-0 md:space-x-4">
+            <div className="text-center">
+              <h2 className="text-xl font-semibold mb-2">Local Screen</h2>
+              <video ref={localVideoRef} className="border rounded w-full max-w-lg" autoPlay playsInline />
+              <div className="mt-2">
+                <button
+                  onClick={startSharing}
+                  disabled={isSharing}
+                  className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:bg-gray-400"
+                >
+                  Start Sharing
+                </button>
+                <button
+                  onClick={stopSharing}
+                  disabled={!isSharing}
+                  className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 disabled:bg-gray-400 ml-2"
+                >
+                  Stop Sharing
+                </button>
+              </div>
+            </div>
+            <div className="text-center">
+              <h2 className="text-xl font-semibold mb-2">Remote Screen</h2>
+              <video
+                ref={remoteVideoRef}
+                className="border rounded w-full max-w-lg cursor-crosshair"
+                autoPlay
+                playsInline
+                onClick={handleRemoteClick}
+                onKeyDown={handleKeyDown}
+                tabIndex={0}
+              />
+            </div>
+          </div>
+          <p className="text-center mt-4 text-lg">{status}</p>
+        </div>
+      );
+    };
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
